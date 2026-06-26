@@ -7,13 +7,16 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.db import models
 from app.services.llm_service import groq_ok
+from app.services.context_service import fetch_company_context
 from app.ai.pipelines.intelligence_pipeline import run_intelligence_pipeline
+from app.ai.guardrails import validate_user_query
 
 router = APIRouter()
 logger = logging.getLogger("chat")
@@ -63,6 +66,84 @@ def _auto_title(question: str) -> str:
     return title if len(title) > 5 else question[:60]
 
 
+def _detect_intent(q: str) -> str:
+    q = q.lower()
+    if any(kw in q for kw in ["invest", "buy", "worth", "long term", "portfolio", "thesis"]):
+        return "investment"
+    if any(kw in q for kw in ["risk", "danger", "downside", "bearish", "concern"]):
+        return "risk"
+    if any(kw in q for kw in ["valuation", "overvalue", "undervalue", "pe", "fair value"]):
+        return "valuation"
+    if any(kw in q for kw in ["news", "moving", "catalyst", "today", "latest"]):
+        return "news"
+    if any(kw in q for kw in ["earnings", "revenue", "eps", "guidance", "quarterly"]):
+        return "earnings"
+    if any(kw in q for kw in ["report", "research", "institutional"]):
+        return "research"
+    if any(kw in q for kw in ["10-k", "10-q", "sec", "filing"]):
+        return "sec"
+    return "general"
+
+
+async def _chat_stream_generator(ticker: str, question: str, session_id: Optional[int]):
+    from app.db.database import SessionLocal
+    db = SessionLocal()
+    try:
+        t = ticker.upper()
+        validate_user_query(question)
+        intent = _detect_intent(question)
+
+        yield f"data: {json.dumps({'status': 'Fetching live market context…'})}\n\n"
+        bundle = await fetch_company_context(t)
+        session = _get_or_create_session(db, t, session_id, _auto_title(question))
+        history_msgs = [{"role": m.role, "content": m.content} for m in session.messages[-8:]]
+
+        yield f"data: {json.dumps({'status': 'Analyzing with Groq…'})}\n\n"
+        result = await run_intelligence_pipeline(question=question, ticker=t, history=history_msgs)
+        summary = result.get("summary", "") or "Analysis unavailable."
+
+        # Stream summary back in word chunks (single Groq call — avoids 429 rate limits)
+        words = summary.split(" ")
+        streamed = ""
+        for i, word in enumerate(words):
+            chunk = ("" if i == 0 else " ") + word
+            streamed += chunk
+            yield f"data: {json.dumps({'token': chunk})}\n\n"
+
+        db.add(models.ChatMessage(session_id=session.id, role="user", content=question))
+        db.add(models.ChatMessage(
+            session_id=session.id, role="assistant", content=streamed,
+            intent=intent, confidence=str(result.get("confidence", "")),
+            sources=json.dumps(result.get("sources_used", [])),
+            citations=json.dumps(result.get("evidence", [])),
+            investment_card=json.dumps(result),
+        ))
+        session.updated_at = datetime.utcnow()
+        if session.title == "New Conversation":
+            session.title = _auto_title(question)
+        db.commit()
+
+        yield f"data: {json.dumps({'done': True, 'session_id': session.id, 'intent': intent, **result})}\n\n"
+    except HTTPException as e:
+        yield f"data: {json.dumps({'error': e.detail})}\n\n"
+    except Exception as e:
+        logger.exception("Chat stream failed")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+    finally:
+        db.close()
+
+
+@router.post("/companies/{ticker}/chat/stream")
+async def chat_stream(ticker: str, request: ChatRequest):
+    if not groq_ok():
+        raise HTTPException(status_code=503, detail="GROQ_API_KEY required.")
+    validate_user_query(request.question)
+    return StreamingResponse(
+        _chat_stream_generator(ticker, request.question, request.session_id),
+        media_type="text/event-stream",
+    )
+
+
 @router.post("/companies/{ticker}/chat")
 async def chat_with_company(ticker: str, request: ChatRequest, db: Session = Depends(get_db)):
     t = ticker.upper()
@@ -73,23 +154,8 @@ async def chat_with_company(ticker: str, request: ChatRequest, db: Session = Dep
             detail="AI chat requires GROQ_API_KEY. Set LLM_PROVIDER=groq in your .env file.",
         )
 
-    q = request.question.lower()
-    if any(kw in q for kw in ["invest", "buy", "worth", "long term", "portfolio", "thesis"]):
-        intent = "investment"
-    elif any(kw in q for kw in ["risk", "danger", "downside", "bearish", "concern"]):
-        intent = "risk"
-    elif any(kw in q for kw in ["valuation", "overvalue", "undervalue", "pe", "fair value"]):
-        intent = "valuation"
-    elif any(kw in q for kw in ["news", "moving", "catalyst", "today", "latest"]):
-        intent = "news"
-    elif any(kw in q for kw in ["earnings", "revenue", "eps", "guidance", "quarterly"]):
-        intent = "earnings"
-    elif any(kw in q for kw in ["report", "research", "institutional"]):
-        intent = "research"
-    elif any(kw in q for kw in ["10-k", "10-q", "sec", "filing"]):
-        intent = "sec"
-    else:
-        intent = "general"
+    validate_user_query(request.question)
+    intent = _detect_intent(request.question)
 
     session = _get_or_create_session(db, t, request.session_id, _auto_title(request.question))
     history_msgs = [{"role": m.role, "content": m.content} for m in session.messages[-8:]]

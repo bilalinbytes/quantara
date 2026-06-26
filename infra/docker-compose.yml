@@ -38,6 +38,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://quantara:password@postgres/quantara_dev
       - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
       - SECRET_KEY=super-secret-quantara-jwt-signing-key-2026
     ports:
       - "8000:8000"
@@ -45,6 +46,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_started
+      qdrant:
         condition: service_started
 
   celery_worker:
@@ -57,9 +60,11 @@ services:
     environment:
       - DATABASE_URL=postgresql://quantara:password@postgres/quantara_dev
       - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
     depends_on:
       - redis
       - postgres
+      - qdrant
 
   celery_beat:
     build:
@@ -71,6 +76,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://quantara:password@postgres/quantara_dev
       - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
     depends_on:
       - redis
       - postgres

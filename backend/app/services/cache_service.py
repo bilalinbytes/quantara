@@ -28,7 +28,12 @@ async def cache_get(key: str) -> Optional[Any]:
     try:
         r = await _get_redis()
         val = await r.get(key)
-        return json.loads(val) if val else None
+        from app.services.metrics_service import inc
+        if val:
+            inc("cache_hits_total")
+            return json.loads(val)
+        inc("cache_misses_total")
+        return None
     except Exception as e:
         logger.warning(f"Redis get failed for {key}: {e}")
         return None

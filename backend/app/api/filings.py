@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session
 from app.schemas.filings import FilingListResponse, FilingParsedResponse, ChatRequest
 from app.services.sec_service import SecService
 from app.ai.pipelines.sec_pipeline import SecPipeline
-from app.db.database import get_db
+from app.ai.guardrails import validate_user_query
+from app.services.rag_service import ingest_ticker_from_edgar, semantic_search
 
 router = APIRouter()
 logger = logging.getLogger("filings")
@@ -32,6 +33,20 @@ async def get_parsed_filing(ticker: str, filing_id: str):
     return await SecService.get_parsed_filing(ticker, filing_id)
 
 
+@router.post("/companies/{ticker}/filings/index")
+async def index_company_filings(ticker: str, filing_type: str = "10-K"):
+    """Ingest latest SEC filing into Qdrant vector store."""
+    count = await ingest_ticker_from_edgar(ticker, filing_type)
+    return {"ticker": ticker.upper(), "chunks_indexed": count, "filing_type": filing_type}
+
+
+@router.get("/companies/{ticker}/filings/search")
+async def search_filings(ticker: str, q: str, top_k: int = 6):
+    validate_user_query(q)
+    results = await semantic_search(q, ticker, top_k=top_k)
+    return {"ticker": ticker.upper(), "query": q, "results": results}
+
+
 @router.post("/chat/filings")
 async def chat_with_filings(request: ChatRequest):
     """
@@ -39,6 +54,7 @@ async def chat_with_filings(request: ChatRequest):
     Streams the answer token by token with real citations.
     Requires GROQ_API_KEY and QDRANT_URL in .env
     """
+    validate_user_query(request.question)
     return StreamingResponse(
         sec_pipeline.chat_stream(
             query=request.question,

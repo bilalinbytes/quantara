@@ -11,7 +11,7 @@ from app.services.context_service import (
     build_context_prompt,
     compute_confidence,
 )
-from app.services.llm_service import llm_complete, groq_ok, QUANTARA_SYSTEM
+from app.services.llm_service import llm_complete, groq_ok, QUANTARA_SYSTEM, GroqRateLimitError
 
 logger = logging.getLogger("intelligence")
 
@@ -149,6 +149,9 @@ async def run_intelligence_pipeline(
     ticker: Optional[str] = None,
     history: Optional[List[Dict]] = None,
 ) -> Dict[str, Any]:
+    from app.ai.guardrails import validate_user_query
+    validate_user_query(question)
+
     if not groq_ok():
         raise HTTPException(status_code=503, detail="GROQ_API_KEY required. Set LLM_PROVIDER=groq in .env.")
 

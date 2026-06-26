@@ -227,53 +227,124 @@ def generate_api_key(user: models.User = Depends(get_current_user), db: Session 
 # MOCK/REAL OAuth Callbacks
 @router.get("/oauth/google/config")
 def google_oauth_config():
-    # Return active state
-    google_id = os.getenv("GOOGLE_CLIENT_ID", "")
-    return {"enabled": google_id != "", "client_id": google_id}
+    from app.config.settings import settings
+    return {
+        "enabled": bool(settings.google_client_id and settings.google_client_secret),
+        "client_id": settings.google_client_id or "",
+        "redirect_uri": settings.google_redirect_uri,
+    }
 
 @router.get("/oauth/github/config")
 def github_oauth_config():
-    github_id = os.getenv("GITHUB_CLIENT_ID", "")
-    return {"enabled": github_id != "", "client_id": github_id}
+    from app.config.settings import settings
+    return {
+        "enabled": bool(settings.github_client_id and settings.github_client_secret),
+        "client_id": settings.github_client_id or "",
+        "redirect_uri": settings.github_redirect_uri,
+    }
 
 class OAuthCallbackRequest(BaseModel):
     code: str
     provider: str
 
 @router.post("/oauth/callback", response_model=TokenResponse)
-def oauth_callback(req: OAuthCallbackRequest, db: Session = Depends(get_db)):
-    # Standard OAuth exchanges:
-    # 1. Exchange 'code' with Google/GitHub for access_token.
-    # 2. Query Google/GitHub user profile details (email, name).
-    # Since we are running in an environment without pre-configured live client keys,
-    # if GOOGLE_CLIENT_ID / GITHUB_CLIENT_ID environment keys are set, we simulate
-    # fetching the provider details using httpx or return a mock account if keys are blank.
-    
-    email = f"oauth_{req.provider}_{str(uuid.uuid4())[:8]}@quantara.ai"
-    name = f"OAuth {req.provider.capitalize()} User"
-    
-    # Check if a user with that email or OAuth ID exists. For simplicity, create user:
-    user = db.query(models.User).filter(models.User.email == email).first()
+async def oauth_callback(req: OAuthCallbackRequest, db: Session = Depends(get_db)):
+    import httpx
+    from app.config.settings import settings
+
+    email = None
+    name = None
+    oauth_subject = None
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        if req.provider == "google" and settings.google_client_id and settings.google_client_secret:
+            token_resp = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": req.code,
+                    "client_id": settings.google_client_id,
+                    "client_secret": settings.google_client_secret,
+                    "redirect_uri": settings.google_redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+            )
+            token_resp.raise_for_status()
+            access_token = token_resp.json().get("access_token")
+            profile = await client.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            profile.raise_for_status()
+            data = profile.json()
+            email = data.get("email")
+            name = data.get("name")
+            oauth_subject = data.get("id")
+        elif req.provider == "github" and settings.github_client_id and settings.github_client_secret:
+            token_resp = await client.post(
+                "https://github.com/login/oauth/access_token",
+                headers={"Accept": "application/json"},
+                data={
+                    "code": req.code,
+                    "client_id": settings.github_client_id,
+                    "client_secret": settings.github_client_secret,
+                    "redirect_uri": settings.github_redirect_uri,
+                },
+            )
+            token_resp.raise_for_status()
+            access_token = token_resp.json().get("access_token")
+            profile = await client.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            profile.raise_for_status()
+            data = profile.json()
+            oauth_subject = str(data.get("id"))
+            name = data.get("name") or data.get("login")
+            if data.get("email"):
+                email = data["email"]
+            else:
+                emails = await client.get(
+                    "https://api.github.com/user/emails",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                if emails.status_code == 200:
+                    primary = next((e for e in emails.json() if e.get("primary")), None)
+                    email = (primary or {}).get("email")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"OAuth provider '{req.provider}' not configured. Set client ID/secret in .env.",
+            )
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Could not retrieve email from OAuth provider")
+
+    user = db.query(models.User).filter(
+        (models.User.email == email) | (
+            (models.User.oauth_provider == req.provider) & (models.User.oauth_subject == oauth_subject)
+        )
+    ).first()
     if not user:
         user = models.User(
             email=email,
-            name=name,
-            role="user"
+            name=name or email.split("@")[0],
+            role="user",
+            oauth_provider=req.provider,
+            oauth_subject=oauth_subject,
         )
         db.add(user)
         db.commit()
         db.refresh(user)
-        
+    else:
+        user.oauth_provider = req.provider
+        user.oauth_subject = oauth_subject
+        if name:
+            user.name = name
+        db.commit()
+
     access = create_access_token({"sub": user.email, "role": user.role})
     ref_token_str = str(uuid.uuid4())
     ref_expiry = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    
-    db_ref = models.RefreshToken(
-        token=ref_token_str,
-        user_id=user.id,
-        expires_at=ref_expiry
-    )
-    db.add(db_ref)
+    db.add(models.RefreshToken(token=ref_token_str, user_id=user.id, expires_at=ref_expiry))
     db.commit()
-    
     return TokenResponse(access_token=access, refresh_token=ref_token_str)

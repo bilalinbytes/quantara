@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     llm_provider: str = "groq"
     groq_api_key: str = "mock"
     groq_model: str = "llama-3.3-70b-versatile"
+    groq_fallback_model: str = "llama-3.1-8b-instant"
 
     # Vector DB
     qdrant_url: str = "http://localhost:6333"
@@ -35,6 +36,17 @@ class Settings(BaseSettings):
 
     # Auth
     secret_key: str = "super-secret-quantara-jwt-signing-key-2026"
+
+    # OAuth
+    google_client_id: Optional[str] = None
+    google_client_secret: Optional[str] = None
+    google_redirect_uri: str = "http://localhost:3000/auth/callback/google"
+    github_client_id: Optional[str] = None
+    github_client_secret: Optional[str] = None
+    github_redirect_uri: str = "http://localhost:3000/auth/callback/github"
+
+    # CORS (comma-separated origins in production)
+    cors_origins: str = "*"
 
     class Config:
         env_file = str(_ENV_FILE)

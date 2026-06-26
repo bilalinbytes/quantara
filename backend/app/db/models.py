@@ -13,6 +13,8 @@ class User(Base):
     role = Column(String, default="user")
     preferences = Column(String, default="{}")
     api_key = Column(String, unique=True, index=True, nullable=True)
+    oauth_provider = Column(String, nullable=True)
+    oauth_subject = Column(String, nullable=True, index=True)
     watchlists = relationship("Watchlist", back_populates="user")
     refresh_tokens = relationship("RefreshToken", back_populates="user")
     chat_sessions = relationship("ChatSession", back_populates="user")

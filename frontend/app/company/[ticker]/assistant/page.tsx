@@ -332,17 +332,17 @@ export default function AssistantPage({ params }: { params: Promise<{ ticker: st
     setMessages(prev => [...prev, { role: 'assistant', content: '', isStreaming: true }]);
 
     try {
-      const res = await fetch(`${API_BASE}/companies/${ticker}/chat`, {
+      const res = await fetch(`${API_BASE}/companies/${ticker}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: question.trim(), session_id: sessionId }),
       });
 
       clearInterval(stepTimer);
-      setReasoningSteps([]);
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: 'Request failed' }));
+        setReasoningSteps([]);
         setMessages(prev => [...prev.slice(0, -1), {
           role: 'assistant',
           content: `**Configuration Required**\n\n${err.detail || 'API error'}`,
@@ -351,29 +351,69 @@ export default function AssistantPage({ params }: { params: Promise<{ ticker: st
         return;
       }
 
-      const data = await res.json();
-      if (data.session_id) { setSessionId(data.session_id); loadSessions(); }
-
-      // Simulate streaming from the summary field
-      const fullText: string = data.summary || data.answer || '';
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
       let streamed = '';
-      const words = fullText.split(' ');
-      for (let i = 0; i < words.length; i++) {
-        streamed += (i === 0 ? '' : ' ') + words[i];
-        setMessages(prev => [...prev.slice(0, -1), { role: 'assistant', content: streamed, isStreaming: true }]);
-        await new Promise(r => setTimeout(r, 15));
+      let finalData: Record<string, unknown> | null = null;
+
+      if (reader) {
+        let buffer = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const evt = JSON.parse(line.slice(6));
+              if (evt.error) {
+                setReasoningSteps([]);
+                setMessages(prev => [...prev.slice(0, -1), {
+                  role: 'assistant',
+                  content: `**Error**\n\n${evt.error}`,
+                  isStreaming: false,
+                }]);
+                return;
+              }
+              if (evt.status) {
+                setReasoningSteps(prev => [...prev, evt.status]);
+              }
+              if (evt.token) {
+                streamed += evt.token;
+                setMessages(prev => [...prev.slice(0, -1), { role: 'assistant', content: streamed, isStreaming: true }]);
+              }
+              if (evt.done) {
+                finalData = evt;
+              }
+            } catch { /* skip malformed SSE */ }
+          }
+        }
       }
 
-      setMessages(prev => [...prev.slice(0, -1), {
-        role: 'assistant',
-        content: fullText,
-        intent: data.intent,
-        confidence: data.confidence,
-        investment_card: data as InvestmentCard,
-        citations: data.citations || [],
-        sources: data.sources || [],
-        isStreaming: false,
-      }]);
+      setReasoningSteps([]);
+
+      if (finalData) {
+        if (finalData.session_id) { setSessionId(finalData.session_id as number); loadSessions(); }
+        const fullText = (finalData.summary as string) || streamed;
+        setMessages(prev => [...prev.slice(0, -1), {
+          role: 'assistant',
+          content: fullText,
+          intent: finalData!.intent as string,
+          confidence: String(finalData!.confidence ?? ''),
+          investment_card: finalData as InvestmentCard,
+          citations: (finalData!.citations as Citation[]) || [],
+          sources: (finalData!.sources_used as string[]) || [],
+          isStreaming: false,
+        }]);
+      } else if (streamed) {
+        setMessages(prev => [...prev.slice(0, -1), {
+          role: 'assistant',
+          content: streamed,
+          isStreaming: false,
+        }]);
+      }
     } catch (e: any) {
       clearInterval(stepTimer);
       setReasoningSteps([]);
